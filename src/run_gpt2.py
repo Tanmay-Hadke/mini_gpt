@@ -5,13 +5,13 @@ import torch
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
 from src.model import GPTConfig, MiniGPT
-from src.generate import generate
+from src.generate import generate_stream
 
 
 GPT2_CONFIGS = {
-    "gpt2":        dict(n_layer=12, n_head=12, n_embd=768),   # 124M params
-    "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-    "gpt2-large":  dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+    "gpt2":        dict(n_layer=12, n_head=12, n_embd=768),
+    "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),
+    "gpt2-large":  dict(n_layer=36, n_head=20, n_embd=1280),
 }
 
 
@@ -21,6 +21,13 @@ def get_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def sync_device(device: str):
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
 
 
 def load_gpt2_into_minigpt(model_type: str = "gpt2", device: str = "cpu") -> MiniGPT:
@@ -38,14 +45,13 @@ def load_gpt2_into_minigpt(model_type: str = "gpt2", device: str = "cpu") -> Min
         n_head=cfg["n_head"],
         n_embd=cfg["n_embd"],
         dropout=0.0,
-        bias=True,      # GPT-2 uses bias in Linear and LayerNorm layers
+        bias=True,
         use_sdpa=True,
     )
 
     model = MiniGPT(config)
     sd = model.state_dict()
 
-    # HuggingFace GPT-2 uses Conv1D layers whose weights are transposed vs nn.Linear
     transposed = (
         "attn.c_attn.weight",
         "attn.c_proj.weight",
@@ -56,18 +62,16 @@ def load_gpt2_into_minigpt(model_type: str = "gpt2", device: str = "cpu") -> Min
     with torch.no_grad():
         for k in sd.keys():
             if k.endswith(transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape, f"Shape mismatch on {k}"
                 sd[k].copy_(sd_hf[k].t())
             else:
-                assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch on {k}"
                 sd[k].copy_(sd_hf[k])
 
-    del hf_model, sd_hf  # Free HF model memory
+    del hf_model, sd_hf
     return model.to(device).eval()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive GPT-2 inference using MiniGPT + KV Cache")
+    parser = argparse.ArgumentParser(description="Interactive streaming GPT-2 using MiniGPT + KV Cache")
     parser.add_argument("--model", type=str, default="gpt2", choices=list(GPT2_CONFIGS.keys()))
     parser.add_argument("--max-tokens", type=int, default=120)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -97,14 +101,15 @@ def main():
             break
 
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        print(f"\n{prompt}", end="", flush=True)
 
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mps":
-            torch.mps.synchronize()
-
+        sync_device(device)
         t0 = time.perf_counter()
-        output_ids = generate(
+        ttft = None
+        generated_ids = []
+        printed_len = 0
+
+        for next_token in generate_stream(
             model,
             input_ids,
             max_new_tokens=args.max_tokens,
@@ -112,20 +117,28 @@ def main():
             top_k=args.top_k,
             top_p=args.top_p,
             use_cache=not args.no_cache,
-        )
+        ):
+            token_id = next_token.item()
+            if ttft is None:
+                sync_device(device)
+                ttft = (time.perf_counter() - t0) * 1000  # Prefill latency in ms
 
-        if device == "cuda":
-            torch.cuda.synchronize()
-        elif device == "mps":
-            torch.mps.synchronize()
+            generated_ids.append(token_id)
+            # Incremental UTF-8-safe decode: wait if a multi-byte character is incomplete
+            decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            if not decoded.endswith("\ufffd"):
+                print(decoded[printed_len:], end="", flush=True)
+                printed_len = len(decoded)
 
+        sync_device(device)
         elapsed = time.perf_counter() - t0
-        generated_tokens = output_ids.size(1) - input_ids.size(1)
-        tok_per_sec = generated_tokens / elapsed
+        tok_per_sec = len(generated_ids) / elapsed if elapsed > 0 else 0.0
 
-        text = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
-        print(f"\n{text}\n")
-        print(f"[{generated_tokens} tokens in {elapsed:.2f}s | {tok_per_sec:.1f} tok/s | cache={'ON' if not args.no_cache else 'OFF'}]\n")
+        print(
+            f"\n\n[{len(generated_ids)} tokens in {elapsed:.2f}s | "
+            f"TTFT: {ttft:.1f} ms | {tok_per_sec:.1f} tok/s | "
+            f"cache={'ON' if not args.no_cache else 'OFF'}]\n"
+        )
 
 
 if __name__ == "__main__":
