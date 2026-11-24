@@ -1,0 +1,19 @@
+=== Mastery Challenge: Manual vs. Fused SDPA Attention (MPS) ===
+
+[Batch=4, SeqLen=256]
+  Numerical Parity (atol=1e-5): True | Max Abs Diff: 3.34e-06
+  Manual Attention :   13.92 ms | Mem: 114.8 MB
+  Fused SDPA       :   11.41 ms | Mem: 114.8 MB | Speedup: 1.22x
+
+[Batch=4, SeqLen=512]
+  Numerical Parity (atol=1e-5): True | Max Abs Diff: 2.98e-06
+  Manual Attention :   33.38 ms | Mem: 134.9 MB
+  Fused SDPA       :   23.55 ms | Mem: 134.9 MB | Speedup: 1.42x
+
+[Batch=4, SeqLen=1024]
+  Numerical Parity (atol=1e-5): True | Max Abs Diff: 3.46e-06
+  Manual Attention :   86.35 ms | Mem: 187.3 MB
+  Fused SDPA       :   50.26 ms | Mem: 187.3 MB | Speedup: 1.72x
+
+=== HuggingFace GPT-2 Logit Parity Check (MPS) ===
+  Parity Match (atol=1e-4): True | Max Logit Error: 4.58e-05

@@ -1,0 +1,17 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Model checkpoints & raw data
+checkpoints/*.pt
+data/input.txt
+
+# macOS / Editor files
+.DS_Store
+.vscode/
+.idea/
