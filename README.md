@@ -1,8 +1,8 @@
 # MiniGPT
 
-**A compact, decoder-only Transformer in PyTorch.** Train an 812K-parameter character model on Tiny Shakespeare, inspect causal attention and KV caching, or import pretrained GPT-2 weights into the same model implementation.
+**Two decoder-only Transformer implementations in PyTorch.** Train an 812K-parameter character model on Tiny Shakespeare, stream pretrained GPT-2 completions, or chat locally with SmolLM2 and Qwen2.5 using a KV cache that carries across turns.
 
-[Quick start](#quick-start) · [Architecture](#architecture) · [Results](#results) · [Generated samples](#generated-samples) · [Project layout](#project-layout)
+[Quick start](#quick-start) · [Instruct chat](#run-multi-turn-instruct-chat) · [Architecture](#architecture) · [Results](#results) · [Generated samples](#generated-samples) · [Project layout](#project-layout)
 
 | Tiny Shakespeare checkpoint | Held-out character perplexity | Saved MPS benchmark at 1,024 tokens |
 | --- | --- | --- |
@@ -18,6 +18,30 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m pytest -q
 ```
+
+### Run multi-turn Instruct chat
+
+```bash
+# SmolLM2 (default)
+python -m src.run_instruct
+
+# Qwen2.5
+python -m src.run_instruct --model Qwen/Qwen2.5-0.5B-Instruct
+
+# Resume a saved SmolLM2 conversation
+python -m src.run_instruct --load-history outputs/chat_history.json
+```
+
+The CLI loads pretrained weights and the matching tokenizer from Hugging Face, then runs inference in MiniLlama on CUDA, MPS, or CPU, in that order. The first run may need to download the model and tokenizer. Replies stream as tokens arrive. The CLI waits for incomplete UTF-8 characters before printing and ends a reply on EOS, a recognized stop token, or the generation limit. Defaults are 256 new tokens, temperature `0.6`, and top-p `0.9`. Set `--temperature 0` for greedy decoding.
+
+| Command | Effect |
+| --- | --- |
+| `history` | Show the conversation currently in memory. |
+| `save` | Write the current messages to `outputs/chat_history.json` or overwrite the path passed to `--load-history`. |
+| `clear` | Reset the conversation and the in-memory KV cache. |
+| `quit` | Exit the chat. |
+
+Each turn formats the conversation with the model's chat template and reserves space for `--max-tokens`. If the prompt exceeds that budget, the CLI drops the oldest user/assistant pairs while retaining the system message and current user prompt. During the session it finds the longest token prefix shared by the new prompt and the in-memory KV cache, trims the cache to that prefix, and prefills the remaining tokens. The terminal reports time to first token (TTFT), tokens per second, prefill tokens versus total prompt tokens, and context usage. Resuming a JSON file restores the messages and starts with an empty KV cache.
 
 ### Train on Tiny Shakespeare
 
@@ -58,9 +82,11 @@ print(tokenizer.decode(output[0].tolist()))
 python -m src.run_gpt2 --model gpt2 --max-tokens 120
 ```
 
-The loader uses Hugging Face's GPT-2 tokenizer and copies pretrained weights into MiniGPT, transposing the GPT-2 `Conv1D` matrices for PyTorch linear layers. The first run may need to download model and tokenizer files. The CLI supports `gpt2`, `gpt2-medium`, and `gpt2-large` and selects CUDA, MPS, or CPU in that order. Use `--temperature 0` for greedy decoding, `--no-cache` to disable KV caching, and `quit` to exit.
+The loader uses Hugging Face's GPT-2 tokenizer and copies pretrained weights into MiniGPT, transposing the GPT-2 `Conv1D` matrices for PyTorch linear layers. The first run may need to download model and tokenizer files. The CLI supports `gpt2`, `gpt2-medium`, and `gpt2-large` and selects CUDA, MPS, or CPU in that order. Completions stream in the terminal, with TTFT and tokens per second reported after each prompt. Use `--temperature 0` for greedy decoding, `--no-cache` to disable KV caching, and `quit` to exit.
 
 ## Architecture
+
+### MiniGPT
 
 Token and learned position embeddings feed pre-normalized decoder blocks. Each block applies causal multi-head self-attention with a combined QKV projection, followed by a GELU feed-forward network with a 4× expansion. Both sublayers use residual connections. A final LayerNorm feeds the vocabulary projection, which shares weights with the token embedding.
 
@@ -75,6 +101,12 @@ Token and learned position embeddings feed pre-normalized decoder blocks. Each b
 | Configured dropout | 0.1 | 0.0 |
 
 [Model code](src/model.py) supports manual masked attention and PyTorch scaled dot-product attention (SDPA). [Generation](src/generate.py) supports greedy decoding and temperature, top-k, and top-p sampling. The KV cache stores each layer's keys and values after processing the prompt, then processes one new token at a time until the context window fills. [Tokenizer code](src/tokenizer.py) also includes a standalone educational byte-level BPE implementation.
+
+`generate_stream()` yields each new token tensor as it is produced. The existing `generate()` API consumes the stream and returns the full sequence, including the prompt.
+
+### MiniLlama
+
+MiniLlama uses RMSNorm before each sublayer and at the output, rotary position embeddings (RoPE) on queries and keys, grouped-query attention (GQA), and a gated SwiGLU feed-forward network. GQA lets groups of query heads share key/value heads, reducing the number of heads stored in the KV cache. The loader reads the checkpoint's configuration and enables QKV projection biases for Qwen2.5. SmolLM2 uses bias-free QKV projections. The checkpoint configuration also controls embedding weight tying. [MiniLlama implementation](src/llama_model.py)
 
 ## Training and evaluation
 
@@ -144,6 +176,10 @@ python -m src.benchmark
 
 This command may download GPT-2 weights and replaces `outputs/benchmark_results.txt` after both checks finish. The reported speedups compare attention implementations. KV-cache correctness is covered by the tests.
 
+### Continuous integration
+
+The GitHub Actions workflow runs on pushes and pull requests targeting `main`. It installs CPU-only PyTorch on Ubuntu with Python 3.11 and runs `python -m pytest tests/ -v`. The suite exercises the existing MiniGPT and tokenizer paths. The saved benchmark concerns MiniGPT and GPT-2, and Instruct chat reports its timing per turn. [CI workflow](.github/workflows/tests.yml)
+
 ## Generated samples
 
 These are verbatim continuations from the Tiny Shakespeare checkpoint, including each prompt on the first line. Both use CPU, temperature 0.8, top-k 20, and 180 new characters.
@@ -175,20 +211,24 @@ As s
 
 - The Tiny Shakespeare model learns dialogue formatting and some local patterns, but often produces invented words and incoherent sentences. Its tokenizer accepts only characters in the training corpus vocabulary.
 - Validation measures sampled next-character prediction on a contiguous slice of the same corpus. It gives a within-corpus estimate, and its perplexity depends on character tokenization.
-- Cached generation requires a nonempty prompt that fits the context window. Once the cache fills, generation rebuilds it from the latest full window on each subsequent step.
+- Cached MiniGPT generation requires a nonempty prompt that fits the context window. Once the cache fills, generation rebuilds it from the latest full window on each subsequent step.
+- Instruct chat caps model context at 4,096 tokens and reserves part of that window for the reply. Keep the current prompt within the remaining budget, since history trimming cannot shorten that message. Cache reuse depends on an exact token-prefix match, and a JSON save contains only the messages still in memory.
 - The saved timings are specific to the recorded MPS run. MPS reports current allocated memory, which cannot establish a peak-memory comparison. GPT-2 logit parity was measured on one prompt.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| [`src/model.py`](src/model.py) | Transformer blocks and attention backends |
+| [`src/model.py`](src/model.py) | MiniGPT blocks and attention backends |
+| [`src/llama_model.py`](src/llama_model.py) | MiniLlama blocks with RMSNorm, RoPE, GQA, and SwiGLU |
 | [`src/tokenizer.py`](src/tokenizer.py) | Character tokenizer and educational byte-level BPE |
 | [`src/train.py`](src/train.py) | Tiny Shakespeare training, loss tracking, and checkpoint export |
-| [`src/generate.py`](src/generate.py) | Autoregressive sampling and KV-cache logic |
-| [`src/run_gpt2.py`](src/run_gpt2.py) | GPT-2 weight import and interactive CLI |
+| [`src/generate.py`](src/generate.py) | MiniGPT streaming, full-sequence generation, and KV caching |
+| [`src/run_gpt2.py`](src/run_gpt2.py) | GPT-2 weight import, streaming CLI, and timing |
+| [`src/run_instruct.py`](src/run_instruct.py) | Instruct weight import, streaming chat, cache reuse, and session history |
 | [`src/benchmark.py`](src/benchmark.py) | Attention timing and Hugging Face logit parity |
 | [`tests/`](tests/) | Causality, cache, attention, and tokenizer tests |
+| [`.github/workflows/tests.yml`](.github/workflows/tests.yml) | CPU-only test workflow for `main` |
 | [`input.txt`](input.txt) · [`minigpt.pt`](minigpt.pt) · [`loss_curve.png`](loss_curve.png) | Corpus, trained checkpoint, and saved training plot |
 | [`outputs/benchmark_results.txt`](outputs/benchmark_results.txt) | Saved MPS benchmark and GPT-2 parity report |
 | [`requirements.txt`](requirements.txt) | Python dependencies |
